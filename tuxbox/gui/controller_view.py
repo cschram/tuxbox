@@ -9,7 +9,7 @@ import os
 from xml.etree import ElementTree as ET
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PySide6.QtCore import Signal, Qt, QRectF, QByteArray
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QPainter, QPalette
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtSvg import QSvgRenderer
 
@@ -45,11 +45,35 @@ class ControllerView(QWidget):
 
     def _load_svg(self):
         """Load the TourBox SVG file"""
+        # Determine which SVG to use based on system dark mode
+        svg_name = 'tourbox_elite.svg'
+
+        # Detect dark mode by checking the window background color luminance
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                palette = app.palette()
+                # Check the window background color
+                window_bg = palette.color(QPalette.Window)
+                r = window_bg.redF()
+                g = window_bg.greenF()
+                b = window_bg.blueF()
+                luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                print(f"DEBUG: Window bg rgb({int(r*255)},{int(g*255)},{int(b*255)}) lum={luminance:.2f}")
+                # In dark mode, Window background is dark (low luminance)
+                if luminance < 0.5:
+                    svg_name = 'tourbox_elite_darkmode.svg'
+                    print(f"DEBUG: Using dark SVG")
+        except Exception as e:
+            print(f"DEBUG: Exception in SVG detection: {e}")
+            logger.warning(f"Could not detect dark mode, using light SVG: {e}")
+
         # Get path to SVG file (relative to this module)
         self._svg_path = os.path.join(
             os.path.dirname(__file__),
             'assets',
-            'tourbox_elite.svg'
+            svg_name
         )
 
         if not os.path.exists(self._svg_path):

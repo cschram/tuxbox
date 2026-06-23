@@ -7,11 +7,11 @@ Displays all TourBox controls and their current mappings.
 import logging
 from typing import Optional, Dict
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
+    QApplication, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QLabel
 )
 from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QPalette
 from evdev import ecodes as e
 
 # Import from existing driver code
@@ -67,10 +67,16 @@ class ControlsList(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_profile: Optional[Profile] = None
+        self._text_color = QColor(0, 0, 0)  # Default fallback
         self._init_ui()
 
     def _init_ui(self):
         """Initialize the UI"""
+        app = QApplication.instance()
+        if app:
+            palette = app.palette()
+            self._text_color = palette.color(QPalette.WindowText)
+
         layout = QVBoxLayout(self)
 
         # Header
@@ -94,6 +100,11 @@ class ControlsList(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(row_height)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        # Use system palette colors for the table
+        app = QApplication.instance()
+        if app:
+            self.table.setPalette(app.palette())
 
         # Set minimum height to match Modifier Combinations table (5 rows + header)
         header_height = self.table.horizontalHeader().height()
@@ -129,7 +140,7 @@ class ControlsList(QWidget):
             name_item.setData(Qt.UserRole, control_name)  # Store internal name
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            name_item.setForeground(QBrush(QColor(0, 0, 0)))  # Black text
+            name_item.setForeground(QBrush(self._text_color))
             self.table.setItem(row, 0, name_item)
 
             # Current action column
@@ -146,7 +157,7 @@ class ControlsList(QWidget):
             action_item.setFlags(action_item.flags() & ~Qt.ItemIsEditable)
             action_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             # Explicitly set foreground color to ensure visibility
-            action_item.setForeground(QBrush(QColor(0, 0, 0)))  # Black text
+            action_item.setForeground(QBrush(self._text_color))
             self.table.setItem(row, 1, action_item)
 
             # Comment column
@@ -154,7 +165,7 @@ class ControlsList(QWidget):
             comment_item = QTableWidgetItem(comment_text)
             comment_item.setFlags(comment_item.flags() & ~Qt.ItemIsEditable)
             comment_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            comment_item.setForeground(QBrush(QColor(0, 0, 0)))  # Black text
+            comment_item.setForeground(QBrush(self._text_color))
             self.table.setItem(row, 2, comment_item)
 
             # Verify it was set

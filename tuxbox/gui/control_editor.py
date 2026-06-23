@@ -7,13 +7,13 @@ Allows editing of individual control actions with modifiers, keys, and action ty
 import logging
 from typing import Optional
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QPushButton, QLineEdit, QGroupBox, QButtonGroup, QTextEdit,
     QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QDialog,
     QDialogButtonBox
 )
 from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QKeyEvent, QPalette
 from evdev import ecodes as e
 from tuxbox.config_loader import VALID_MODIFIER_BUTTONS
 from tuxbox.gui.ui_constants import TABLE_ROW_HEIGHT_MULTIPLIER, TEXT_EDIT_HEIGHT_MULTIPLIER
@@ -467,7 +467,7 @@ class ComboConfigDialog(QDialog):
             "Haptic feedback for this modifier+dial combination."
         )
         haptic_info.setWordWrap(True)
-        haptic_info.setStyleSheet("color: #666; font-size: 10px;")
+        haptic_info.setStyleSheet("color: palette(mid); font-size: 10px;")
         haptic_layout.addWidget(haptic_info)
 
         layout.addWidget(self.haptic_group)
@@ -685,7 +685,7 @@ class DoublePressDialog(QDialog):
             f"Single-press actions fire immediately (no delay)."
         )
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #666; font-size: 10px; margin-bottom: 10px;")
+        info_label.setStyleSheet("color: palette(mid); font-size: 10px; margin-bottom: 10px;")
         layout.addWidget(info_label)
 
         # Action type selection
@@ -949,6 +949,10 @@ class ControlEditor(QWidget):
 
     def _init_ui(self):
         """Initialize the UI"""
+        app = QApplication.instance()
+        if app:
+            self.setPalette(app.palette())
+
         layout = QVBoxLayout(self)
 
         # Header
@@ -958,7 +962,7 @@ class ControlEditor(QWidget):
 
         # Control name display
         self.control_label = QLabel("No control selected")
-        self.control_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.control_label.setStyleSheet("font-size: 12px; color: palette(window-text);")
         layout.addWidget(self.control_label)
 
         # Action type selection
@@ -1133,7 +1137,7 @@ class ControlEditor(QWidget):
             "Per-dial haptic setting. 'Use Profile Default' uses the profile's global setting."
         )
         haptic_info.setWordWrap(True)
-        haptic_info.setStyleSheet("color: #666; font-size: 10px;")
+        haptic_info.setStyleSheet("color: palette(mid); font-size: 10px;")
         haptic_layout.addWidget(haptic_info)
 
         layout.addWidget(self.haptic_group)
@@ -1167,7 +1171,7 @@ class ControlEditor(QWidget):
         dp_section_layout.addWidget(dp_label)
 
         self.dp_action_label = QLabel("(none)")
-        self.dp_action_label.setStyleSheet("color: #666;")
+        self.dp_action_label.setStyleSheet("color: palette(mid);")
         dp_section_layout.addWidget(self.dp_action_label)
 
         dp_section_layout.addStretch()
@@ -1990,7 +1994,7 @@ class ControlEditor(QWidget):
             self.dp_clear_btn.setEnabled(True)
         else:
             self.dp_action_label.setText("(none)")
-            self.dp_action_label.setStyleSheet("color: #666;")
+            self.dp_action_label.setStyleSheet("color: palette(mid);")
             self.dp_clear_btn.setEnabled(False)
 
     def _on_configure_double_press(self):
