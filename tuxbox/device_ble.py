@@ -39,11 +39,18 @@ UNLOCK_COMMAND = bytes.fromhex("5500078894001afe")
 TOURBOX_NAME_PREFIX = "TourBox"
 
 
-async def disconnect_existing_device(timeout: float = 10.0):
-    """
-    Bleak cant detect already connected devices causing a poor user experience 
-    if a bluetooth manager automatically connects the device. 
-    Disconnect via dbus-fast (bleak dep) before the BLE connection attempt
+async def find_connected_tourbox(timeout: float = 10.0) -> Optional[BLEDevice]:
+    """Check BlueZ for an already-connected TourBox device.
+
+    BleakScanner cannot discover devices that are already connected to BlueZ.
+    Rather than disconnecting and rescanning (which triggers BlueZ to immediately
+    reconnect, causing a loop), we instead use the existing connection directly.
+
+    Constructs a BLEDevice with the BlueZ D-Bus path in details so that
+    BleakClient can attach to the existing connection without scanning.
+
+    Returns:
+        BLEDevice if a connected TourBox is found, None otherwise.
     """
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
@@ -58,64 +65,52 @@ async def disconnect_existing_device(timeout: float = 10.0):
         res = await asyncio.wait_for(bus.call(msg), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning("Timeout while enumerating bluetooth devices")
-        return
+        return None
     except Exception:
         logger.warning("Error while enumerating bluetooth devices")
-        return
-    
-    connection_path = None
+        return None
 
     for path, props in res.body[0].items():
         if 'org.bluez.Device1' not in props:
             continue
 
         device_info = props['org.bluez.Device1']
-        if not device_info['Connected'].value or not device_info['Alias'].value.startswith(TOURBOX_NAME_PREFIX):
+        alias = device_info.get('Alias') or device_info.get('Name')
+        name = alias.value if alias else None
+
+        if not device_info['Connected'].value or not name or not name.startswith(TOURBOX_NAME_PREFIX):
             continue
-       
-        connection_path = path
-        break
 
-    if not connection_path:
-        return
+        # D-Bus path format: /org/bluez/hci0/dev_DD_6A_5F_61_0E_12
+        address = path.split('/')[-1].replace('dev_', '').replace('_', ':')
+        logger.info(f"Found already connected TourBox device: {name} at {address}")
+        # Pass the D-Bus path in details so BleakClient uses the existing
+        # BlueZ connection object directly rather than trying to scan for it.
+        return BLEDevice(address, name, {"path": path})
 
-    logger.info(f"Found already connected device {connection_path}, disconnecting")
-
-    msg = Message(
-        destination="org.bluez",
-        path=connection_path,
-        interface="org.bluez.Device1",
-        member="Disconnect",
-        signature=""
-    )
-
-    try:
-        res = await asyncio.wait_for(bus.call(msg), timeout=timeout)
-        logger.info(f"Disconnected {connection_path}")
-    except asyncio.TimeoutError:
-        logger.warning("Unable to disconnect already connected device")
-    except Exception:
-        logger.warning("Error while disconnecting bluetooth device")
-        return
+    return None
 
 
 async def scan_for_tuxbox(timeout: float = 10.0) -> Optional[BLEDevice]:
-    """Scan for TourBox devices by name prefix.
+    """Find a TourBox device, checking for an existing BlueZ connection first.
 
-    Scans for BLE devices whose name starts with "TourBox" (e.g., TourBox Elite,
-    TourBox Elite Plus, TourBox Lite). Stops scanning as soon as a device is found.
+    Checks whether a TourBox is already connected to BlueZ (e.g. auto-connected
+    by a Bluetooth manager) and returns it directly. Falls back to a BLE scan
+    only when no existing connection is found.
 
     Args:
         timeout: Scan timeout in seconds (default 10.0)
 
     Returns:
-        BLEDevice if found, None otherwise
+        BLEDevice if found, None otherwise.
     """
-
-    await disconnect_existing_device(timeout)
+    connected = await find_connected_tourbox(timeout)
+    if connected:
+        print(f"Found {connected.name} at {connected.address}")
+        return connected
 
     logger.info(f"Scanning for TourBox devices (timeout: {timeout}s)...")
-    print(f"Scanning for TourBox devices...")
+    print("Scanning for TourBox devices...")
 
     found_device: Optional[BLEDevice] = None
     stop_event = asyncio.Event()
@@ -161,7 +156,7 @@ class TuxBoxBLE(TuxBoxBase):
             config_path: Path to configuration file
         """
         super().__init__(pidfile=pidfile, config_path=config_path)
-        self.device: Optional[BLEDevice] = None  # Discovered device from scanning
+        self.device: Optional[BLEDevice] = None
         self.client: Optional[BleakClient] = None
         self.disconnected = False
         self.reconnect_delay = 5.0  # Initial reconnection delay in seconds
@@ -256,7 +251,7 @@ class TuxBoxBLE(TuxBoxBase):
             True if should retry connection, False if user requested exit
         """
         try:
-            # Scan for TourBox device
+            # Scan for TourBox device (or pick up existing BlueZ connection)
             self.device = await scan_for_tuxbox(timeout=10.0)
             if not self.device:
                 logger.error("No TourBox device found")
@@ -267,7 +262,7 @@ class TuxBoxBLE(TuxBoxBase):
             self.disconnected = False
 
             async with BleakClient(
-                self.device.address,
+                self.device,
                 timeout=5.0,
                 disconnected_callback=self.disconnection_handler
             ) as client:
@@ -283,7 +278,8 @@ class TuxBoxBLE(TuxBoxBase):
 
                 logger.info("TourBox Elite ready! Press buttons to generate input events.")
                 print("TourBox Elite connected and ready!")
-                print(f"Virtual input device: {self.controller.device.path}")
+                dev_path = self.controller.device.path if self.controller.device else "unknown"
+                print(f"Virtual input device: {dev_path}")
 
                 if self.use_profiles:
                     print(f"Profile switching enabled - Current profile: {self.current_profile.name}")
