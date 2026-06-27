@@ -9,7 +9,7 @@ import sys
 import os
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -38,84 +38,161 @@ UNLOCK_COMMAND = bytes.fromhex("5500078894001afe")
 # Device name prefix for scanning
 TOURBOX_NAME_PREFIX = "TourBox"
 
+# How long to wait for BlueZ to resolve a connected device's GATT services.
+# Kept separate from the enumerate/scan timeout so the resolve wait doesn't
+# inherit the full discovery budget.
+SERVICE_RESOLVE_TIMEOUT = 5.0
 
-async def disconnect_existing_device(timeout: float = 10.0):
+
+async def _wait_services_resolved(bus: MessageBus, path: str, timeout: float) -> bool:
+    """Poll a device's BlueZ ``ServicesResolved`` property until it becomes true.
+
+    BlueZ resolves a device's GATT database asynchronously after the link comes
+    up. If Bleak attaches before this completes, its connect step races GATT
+    discovery against the link and can fail with "failed to discover services,
+    device disconnected". Waiting here lets BlueZ finish first; we never touch
+    the connection itself.
+
+    Args:
+        bus: An already-connected system MessageBus.
+        path: The BlueZ D-Bus object path of the device.
+        timeout: Maximum time to wait, in seconds.
+
+    Returns:
+        True if services resolved within the timeout, False otherwise.
     """
-    Bleak cant detect already connected devices causing a poor user experience 
-    if a bluetooth manager automatically connects the device. 
-    Disconnect via dbus-fast (bleak dep) before the BLE connection attempt
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        msg = Message(
+            destination="org.bluez",
+            path=path,
+            interface="org.freedesktop.DBus.Properties",
+            member="Get",
+            signature="ss",
+            body=["org.bluez.Device1", "ServicesResolved"],
+        )
+        try:
+            reply = await bus.call(msg)
+            if reply and reply.body and reply.body[0].value:
+                return True
+        except Exception:
+            # Device may have vanished from BlueZ (disconnected/removed).
+            return False
+        await asyncio.sleep(0.3)
+    return False
+
+
+async def find_connected_tourbox(timeout: float = 10.0) -> Tuple[Optional[BLEDevice], bool]:
+    """Check BlueZ for an already-connected TourBox device.
+
+    BleakScanner cannot discover devices that are already connected to BlueZ.
+    Rather than disconnecting and rescanning (which triggers BlueZ to immediately
+    reconnect, causing a loop), we instead use the existing connection directly.
+
+    Before returning, we wait for BlueZ to finish GATT service discovery
+    (``ServicesResolved``). Attaching mid-discovery makes Bleak's connect race
+    the link and fail; once services are resolved Bleak's discovery step returns
+    immediately. BlueZ keeps control of the connection throughout.
+
+    Constructs a BLEDevice with the BlueZ D-Bus path in details so that
+    BleakClient can attach to the existing connection without scanning.
+
+    Returns:
+        A tuple ``(device, connected)``. ``device`` is a BLEDevice for an
+        already-connected, services-resolved TourBox, or None if none was usable.
+        ``connected`` is True when a TourBox is currently connected to BlueZ even
+        if its services have not resolved yet; in that case the caller should
+        retry this check rather than fall back to scanning, since BleakScanner
+        cannot see already-connected devices.
     """
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-
-    msg = Message(
-        destination="org.bluez",
-        path="/",
-        interface="org.freedesktop.DBus.ObjectManager",
-        member="GetManagedObjects",
-    )
-
     try:
-        res = await asyncio.wait_for(bus.call(msg), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("Timeout while enumerating bluetooth devices")
-        return
-    except Exception:
-        logger.warning("Error while enumerating bluetooth devices")
-        return
-    
-    connection_path = None
+        msg = Message(
+            destination="org.bluez",
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="GetManagedObjects",
+        )
 
-    for path, props in res.body[0].items():
-        if 'org.bluez.Device1' not in props:
-            continue
+        try:
+            res = await asyncio.wait_for(bus.call(msg), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout while enumerating bluetooth devices")
+            return None, False
+        except Exception:
+            logger.warning("Error while enumerating bluetooth devices")
+            return None, False
 
-        device_info = props['org.bluez.Device1']
-        if not device_info['Connected'].value or not device_info['Alias'].value.startswith(TOURBOX_NAME_PREFIX):
-            continue
-       
-        connection_path = path
-        break
+        connected_found = False
+        for path, props in res.body[0].items():
+            device_info = props.get('org.bluez.Device1')
+            if not device_info:
+                continue
 
-    if not connection_path:
-        return
+            alias = device_info.get('Alias') or device_info.get('Name')
+            name = alias.value if alias else None
+            connected = device_info.get('Connected')
+            connected = connected.value if connected else False
 
-    logger.info(f"Found already connected device {connection_path}, disconnecting")
+            if not connected or not name or not name.startswith(TOURBOX_NAME_PREFIX):
+                continue
 
-    msg = Message(
-        destination="org.bluez",
-        path=connection_path,
-        interface="org.bluez.Device1",
-        member="Disconnect",
-        signature=""
-    )
+            # A TourBox is connected to BlueZ; a rescan can't improve on this
+            # even if this particular entry turns out to be unusable below.
+            connected_found = True
 
-    try:
-        res = await asyncio.wait_for(bus.call(msg), timeout=timeout)
-        logger.info(f"Disconnected {connection_path}")
-    except asyncio.TimeoutError:
-        logger.warning("Unable to disconnect already connected device")
-    except Exception:
-        logger.warning("Error while disconnecting bluetooth device")
-        return
+            # D-Bus path format: /org/bluez/hci0/dev_DD_6A_5F_61_0E_12
+            address = path.split('/')[-1].replace('dev_', '').replace('_', ':')
+
+            # Let BlueZ finish service discovery before Bleak attaches.
+            resolved = device_info.get('ServicesResolved')
+            resolved = resolved.value if resolved else False
+            if not resolved:
+                logger.info(f"Found {name}; waiting for BlueZ to resolve services...")
+                resolved = await _wait_services_resolved(bus, path, SERVICE_RESOLVE_TIMEOUT)
+                if not resolved:
+                    logger.warning(
+                        f"{name} connected but services not resolved within "
+                        f"{SERVICE_RESOLVE_TIMEOUT}s"
+                    )
+                    # Another adapter may expose a usable entry; keep looking.
+                    continue
+
+            logger.info(f"Found already connected TourBox device: {name} at {address}")
+            # Pass the D-Bus path in details so BleakClient uses the existing
+            # BlueZ connection object directly rather than trying to scan for it.
+            return BLEDevice(address, name, {"path": path}), True
+
+        return None, connected_found
+    finally:
+        bus.disconnect()
 
 
 async def scan_for_tuxbox(timeout: float = 10.0) -> Optional[BLEDevice]:
-    """Scan for TourBox devices by name prefix.
+    """Find a TourBox device, checking for an existing BlueZ connection first.
 
-    Scans for BLE devices whose name starts with "TourBox" (e.g., TourBox Elite,
-    TourBox Elite Plus, TourBox Lite). Stops scanning as soon as a device is found.
+    Checks whether a TourBox is already connected to BlueZ (e.g. auto-connected
+    by a Bluetooth manager) and returns it directly. Falls back to a BLE scan
+    only when no existing connection is found.
 
     Args:
         timeout: Scan timeout in seconds (default 10.0)
 
     Returns:
-        BLEDevice if found, None otherwise
+        BLEDevice if found, None otherwise.
     """
-
-    await disconnect_existing_device(timeout)
+    device, connected = await find_connected_tourbox(timeout)
+    if device:
+        print(f"Found {device.name} at {device.address}")
+        return device
+    if connected:
+        # A TourBox is connected but BlueZ hasn't resolved its services yet.
+        # BleakScanner cannot see already-connected devices, so a scan would be
+        # futile; return None and let the reconnect loop retry the BlueZ check.
+        return None
 
     logger.info(f"Scanning for TourBox devices (timeout: {timeout}s)...")
-    print(f"Scanning for TourBox devices...")
+    print("Scanning for TourBox devices...")
 
     found_device: Optional[BLEDevice] = None
     stop_event = asyncio.Event()
@@ -161,7 +238,7 @@ class TuxBoxBLE(TuxBoxBase):
             config_path: Path to configuration file
         """
         super().__init__(pidfile=pidfile, config_path=config_path)
-        self.device: Optional[BLEDevice] = None  # Discovered device from scanning
+        self.device: Optional[BLEDevice] = None
         self.client: Optional[BleakClient] = None
         self.disconnected = False
         self.reconnect_delay = 5.0  # Initial reconnection delay in seconds
@@ -256,7 +333,7 @@ class TuxBoxBLE(TuxBoxBase):
             True if should retry connection, False if user requested exit
         """
         try:
-            # Scan for TourBox device
+            # Scan for TourBox device (or pick up existing BlueZ connection)
             self.device = await scan_for_tuxbox(timeout=10.0)
             if not self.device:
                 logger.error("No TourBox device found")
@@ -267,7 +344,7 @@ class TuxBoxBLE(TuxBoxBase):
             self.disconnected = False
 
             async with BleakClient(
-                self.device.address,
+                self.device,
                 timeout=5.0,
                 disconnected_callback=self.disconnection_handler
             ) as client:
@@ -283,7 +360,8 @@ class TuxBoxBLE(TuxBoxBase):
 
                 logger.info("TourBox Elite ready! Press buttons to generate input events.")
                 print("TourBox Elite connected and ready!")
-                print(f"Virtual input device: {self.controller.device.path}")
+                dev_path = self.controller.device.path if self.controller.device else "unknown"
+                print(f"Virtual input device: {dev_path}")
 
                 if self.use_profiles:
                     print(f"Profile switching enabled - Current profile: {self.current_profile.name}")
